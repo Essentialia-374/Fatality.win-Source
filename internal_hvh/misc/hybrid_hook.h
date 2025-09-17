@@ -1,176 +1,165 @@
 #pragma once
+#include <cstdint>
+#include <memory>
+#include <vector>
+#include <unordered_map>
 
-class c_hook
-{
+#include <polyhook2/Detour/x86Detour.hpp>
+#include <polyhook2/ZydisDisassembler.hpp>
+#include <polyhook2/Virtuals/VFuncSwapHook.hpp>
+#include <polyhook2/Virtuals/VTableSwapHook.hpp>
+
+class c_hook {
 public:
-	virtual uintptr_t apply( uintptr_t dest ) { return 0; }
-	virtual uintptr_t apply( const uint32_t index, uintptr_t func ) { return 0; }
-	virtual bool is_detour() { return false; }
-	virtual ~c_hook() {}
+    virtual ~c_hook() = default;
+
+    virtual uintptr_t apply(uintptr_t) { return 0; }
+
+    virtual uintptr_t apply(uint32_t, uintptr_t) { return 0; }
+
+    virtual bool is_detour() { return false; }
 };
 
-class c_detour : public c_hook
-{
-	void* original = nullptr;
-#ifndef RELEASE
-	std::vector<std::uint8_t> original_bytes;
-#endif
-	std::uint8_t* src{};
-
+class c_detour : public c_hook {
 public:
-	c_detour() = default;
-	__forceinline c_detour( uintptr_t ent ) : src( reinterpret_cast< std::uint8_t* >( ent ) )
-	{}
+    using address_t = uintptr_t;
 
-	~c_detour() override
-	{
-#ifndef RELEASE
-		DWORD old_protect;
-		VirtualProtect( src, original_bytes.size(), PAGE_EXECUTE_READWRITE, &old_protect );
-		memcpy( src, original_bytes.data(), original_bytes.size() );
-		VirtualProtect( src, original_bytes.size(), old_protect, &old_protect );
-#endif
-		if ( original )
-		{
-			syscall( NtFreeVirtualMemory )( current_process, &original, nullptr, MEM_RELEASE );
-			sysunlock();
-		}
-	}
+    c_detour() = default;
+    explicit c_detour(address_t src) : m_src(src) {}
+    ~c_detour() override { unhook(); }
 
-	__forceinline bool is_detour() override { return true; }
+    bool is_detour() override { return true; }
 
-	__forceinline static uint32_t length_disasm( uint8_t* op )
-	{
-		uint32_t size, code;
-		return reinterpret_cast< bool( * )( uint8_t*, uint32_t*, uint32_t* ) >( make_offset_direct( xorstr_( "gameoverlayrenderer.dll" ), sig_length_disasm_game ) )( op, &size, &code ) ? size : 0xFFFF;
-	}
+    // commit the detour. 
+    // dest: address of your hook function. Returns trampoline ptr (original).
+    address_t apply(address_t dest) override {
+        if (m_detour) {
+            return static_cast<address_t>(m_trampoline);
+        }
+        if (!m_src || !dest) {
+            return 0;
+        }
 
-	__forceinline uintptr_t apply( uintptr_t dest ) override
-	{
-		auto add = 0;
-		DWORD len = 0;
-		auto opcode = src;
-		while ( opcode - src < 5 )
-		{
-			if ( *opcode == 0xE8 )
-				add = len + 1;
-			if ( *opcode == 0x3B )
-				len += 2;
-			else if ( *opcode == 0x66 )
-				len += 5;
-			else
-				len += length_disasm( opcode );
-			opcode = src + len;
-		}
+        static_assert(sizeof(void*) == 4, "c_detour is configured for x86 only. Build 32-bit or switch to x64Detour.");
 
-		const auto op_code = std::make_unique<std::uint8_t[]>( len + 5 );
-		//auto return_mem = VirtualAlloc( nullptr, len + 5, MEM_COMMIT, PAGE_EXECUTE_READWRITE );
-		auto return_mem = memory::alloc_mem( len + 5 );
-		for ( std::uint32_t i = 0; i < len; i++ )
-		{
-			op_code[ i ] = src[ i ];
-#ifndef RELEASE
-			original_bytes.push_back( src[ i ] );
-#endif
-		}
+        // Construct and commit the PLH detour 
+        // (using Zydis as the backend)
+        m_detour = std::make_unique<PLH::x86Detour>(
+            static_cast<uint64_t>(m_src),
+            static_cast<uint64_t>(dest),
+            &m_trampoline,
+            m_dis
+        );
 
-		op_code[ len ] = 0xE9;
-		*reinterpret_cast< std::uint32_t* >( op_code.get() + len + 1 ) = reinterpret_cast<
-			std::uint32_t
-		>( src ) - ( reinterpret_cast< std::uint32_t >( return_mem ) + 5 );
+        const bool ok = m_detour->hook();
+        if (!ok) {
+            m_detour.reset();
+            m_trampoline = 0;
+            return 0;
+        }
+        return static_cast<address_t>(m_trampoline);
+    }
 
-		std::memcpy( return_mem, op_code.get(), len + 5 );
+    template <typename Fn>
+    Fn original() const { return reinterpret_cast<Fn>(m_trampoline); }
 
-		if ( add )
-		{
-			*reinterpret_cast< std::uint32_t* >( reinterpret_cast< std::uint32_t >( return_mem ) + add ) -= reinterpret_cast< uintptr_t >( return_mem );
-			*reinterpret_cast< std::uint32_t* >( reinterpret_cast< std::uint32_t >( return_mem ) + add ) += reinterpret_cast< uintptr_t >( src );
-		}
+    void unhook() {
+        if (m_detour) {
+            m_detour->unHook();
+            m_detour.reset();
+            m_trampoline = 0;
+        }
+    }
 
-		/*DWORD old_protect;
-		VirtualProtect( src, len, PAGE_EXECUTE_READWRITE, &old_protect );
-
-		*src = 0xE9;
-		*reinterpret_cast< std::uint32_t* >( src + 1 ) = ( uintptr_t ) ( dest ) -reinterpret_cast< std::uint32_t >( src ) - 5;
-		for ( std::uint32_t i = 5; i < len; ++i )
-			src[ i ] = 0x90;
-
-		VirtualProtect( src, len, old_protect, &old_protect );
-
-		return reinterpret_cast< Fn >( original = return_mem );*/
-
-		DWORD old_protect;
-		memory::protect_mem( src, len, PAGE_EXECUTE_READWRITE, old_protect );
-
-		*src = 0xE9;
-		*reinterpret_cast< std::uint32_t* >( src + 1 ) = ( uintptr_t ) ( dest ) -reinterpret_cast< std::uint32_t >( src ) - 5;
-		for ( std::uint32_t i = 5; i < len; ++i )
-			src[ i ] = 0x90;
-
-		memory::protect_mem( src, len, old_protect, old_protect );
-
-		return reinterpret_cast< uintptr_t >( original = return_mem );
-	}
-};
-
-
-class c_vtable_hook : public c_hook
-{
-public:
-	explicit c_vtable_hook( uintptr_t ent )
-	{
-		base = reinterpret_cast< uintptr_t* >( ent );
-		original = *base;
-
-		const auto l = length() + 1;
-		current = std::make_unique<uint32_t[]>( l );
-		std::memcpy( current.get(), reinterpret_cast< void* >( original - sizeof( uint32_t ) ), l * sizeof( uint32_t ) );
-
-		patch_pointer( base );
-	}
-
-	~c_vtable_hook() override
-	{
-#ifndef RELEASE
-		DWORD old;
-		memory::protect_mem( base, sizeof( uintptr_t ), PAGE_READWRITE, old );
-		*base = original;
-		memory::protect_mem( base, sizeof( uintptr_t ), old, old );
-#endif
-	}
-
-	__forceinline uintptr_t apply( const uint32_t index, uintptr_t func ) override
-	{
-		auto old = reinterpret_cast< uintptr_t* >( original )[ index ];
-		current.get()[ index + 1 ] = func;
-		return old;
-	}
-
-	void patch_pointer( uintptr_t* location ) const
-	{
-		if ( !location )
-			return;
-
-		DWORD old;
-		memory::protect_mem( location, sizeof( uintptr_t ), PAGE_READWRITE, old );
-		*location = reinterpret_cast< uint32_t >( current.get() ) + sizeof( uint32_t );
-		memory::protect_mem( location, sizeof( uintptr_t ), old, old );
-	}
+    address_t src() const { return m_src; }
+    address_t apply(const uint32_t, address_t) override { return 0; } // unused overload
 
 private:
-	uint32_t length() const
-	{
-		uint32_t index;
-		const auto vmt = reinterpret_cast< uint32_t* >( original );
+    address_t m_src{ 0 };
+    uint64_t m_trampoline{ 0 }; // PolyHook2 stores tramp as u64
 
-		for ( index = 0; vmt[ index ]; index++ )
-			if ( IS_INTRESOURCE( vmt[ index ] ) )
-				break;
+    // Disassembler must remain alive as long as the detour
+    PLH::ZydisDisassembler m_dis{ PLH::Mode::x86 };
+    std::unique_ptr<PLH::x86Detour> m_detour; // controls hook lifetime
 
-		return index;
-	}
+    c_detour(const c_detour&) = delete;
+    c_detour& operator=(const c_detour&) = delete;
+    c_detour(c_detour&&) noexcept = default;
+    c_detour& operator=(c_detour&&) noexcept = default;
+};
 
-	std::uintptr_t* base;
-	std::uintptr_t original;
-	std::unique_ptr<uint32_t[]> current;
+class c_vtable_hook : public c_hook {
+public:
+    enum class mode { vfunc_swap, vtable_swap };
+
+    explicit c_vtable_hook(uintptr_t instance, mode m = mode::vfunc_swap)
+        : m_instance(instance), m_mode(m) {
+    }
+
+    ~c_vtable_hook() override { unhook_all(); }
+
+    // Hook a single virtual at index with replacement pointer
+    // Returns the original function pointer.
+    uintptr_t apply(uint32_t index, uintptr_t replacement) override {
+        if (!m_instance) return 0;
+
+        // Grab the original from the live vtable 
+        // (safe for both modes)
+        auto** vt_ptr = reinterpret_cast<uintptr_t**>(m_instance);
+        uintptr_t original = (*vt_ptr)[index];
+
+        HookEntry entry{};
+        entry.index = index;
+        entry.original = original;
+
+        if (m_mode == mode::vfunc_swap) {
+            // In-place swap of one vfunc entry
+            auto hook = std::make_unique<PLH::VFuncSwapHook>(
+                reinterpret_cast<uint64_t*>(*vt_ptr),
+                static_cast<uint16_t>(index),
+                static_cast<uint64_t>(replacement)
+            );
+            if (!hook->hook()) {
+                return 0;
+            }
+            entry.vfunc = std::move(hook);
+        }
+        else {
+            // Deep copy entire table, redirect this index, swap the vptr
+            auto hook = std::make_unique<PLH::VTableSwapHook>(
+                static_cast<uint64_t>(m_instance),
+                static_cast<uint16_t>(index),
+                static_cast<uint64_t>(replacement)
+            );
+            if (!hook->hook()) {
+                return 0;
+            }
+            entry.vtable = std::move(hook);
+        }
+
+        m_hooks.emplace_back(std::move(entry));
+        return original;
+    }
+
+    void unhook_all() {
+        for (auto& e : m_hooks) {
+            if (e.vfunc)  e.vfunc->unHook();
+            if (e.vtable) e.vtable->unHook();
+        }
+        m_hooks.clear();
+    }
+
+    bool is_detour() override { return false; }
+
+private:
+    struct HookEntry {
+        uint32_t index{};
+        uintptr_t original{};
+        std::unique_ptr<PLH::VFuncSwapHook>  vfunc;
+        std::unique_ptr<PLH::VTableSwapHook> vtable;
+    };
+
+    uintptr_t m_instance{ 0 };
+    mode m_mode{ mode::vfunc_swap };
+    std::vector<HookEntry> m_hooks{};
 };
